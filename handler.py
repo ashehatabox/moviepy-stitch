@@ -1,17 +1,16 @@
 """
-RunPod Serverless Handler: MoviePy Video Stitcher
+RunPod Serverless Handler: FFmpeg Video Stitcher
 
-Deploy this to RunPod as a custom serverless endpoint.
-It downloads video segments from URLs and concatenates them using MoviePy.
+Uses pure FFmpeg (no MoviePy) - simpler and more reliable.
 """
 
 import os
 import tempfile
+import subprocess
 import requests
 import runpod
-from moviepy.editor import VideoFileClip, concatenate_videoclips
-from typing import List
 import base64
+from typing import List
 
 
 def download_video(url: str, temp_dir: str, index: int) -> str:
@@ -21,6 +20,7 @@ def download_video(url: str, temp_dir: str, index: int) -> str:
     response = requests.get(url, stream=True, timeout=120)
     response.raise_for_status()
     
+    # Detect extension from URL or content-type
     content_type = response.headers.get("content-type", "video/mp4")
     ext = ".webm" if "webm" in content_type or url.endswith(".webm") else ".mp4"
     
@@ -36,75 +36,100 @@ def download_video(url: str, temp_dir: str, index: int) -> str:
     return filepath
 
 
-def stitch_videos(segment_paths: List[str], output_path: str) -> dict:
-    """Concatenate video segments using MoviePy."""
-    print(f"Stitching {len(segment_paths)} segments...")
-    
-    clips = []
-    total_duration = 0
-    
+def get_video_duration(filepath: str) -> float:
+    """Get video duration using ffprobe."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        filepath
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
     try:
-        for i, path in enumerate(segment_paths):
-            print(f"Loading clip {i+1}: {path}")
-            clip = VideoFileClip(path)
-            print(f"  -> Duration: {clip.duration:.2f}s, Size: {clip.size}")
-            clips.append(clip)
-            total_duration += clip.duration
+        return float(result.stdout.strip())
+    except:
+        return 0.0
+
+
+def stitch_videos_ffmpeg(segment_paths: List[str], output_path: str) -> dict:
+    """Concatenate video segments using FFmpeg concat demuxer."""
+    print(f"Stitching {len(segment_paths)} segments with FFmpeg...")
+    
+    # Create concat file list
+    temp_dir = os.path.dirname(output_path)
+    concat_file = os.path.join(temp_dir, "concat_list.txt")
+    
+    with open(concat_file, "w") as f:
+        for path in segment_paths:
+            # FFmpeg concat requires escaped paths
+            escaped_path = path.replace("'", "'\\''")
+            f.write(f"file '{escaped_path}'\n")
+    
+    print(f"Concat file created: {concat_file}")
+    
+    # Run FFmpeg concat
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", concat_file,
+        "-c", "copy",  # Stream copy (fast, no re-encoding)
+        output_path
+    ]
+    
+    print(f"Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        print(f"FFmpeg stderr: {result.stderr}")
+        # Try with re-encoding if stream copy fails
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", concat_file,
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "23",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            output_path
+        ]
+        print(f"Retrying with re-encode: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
         
-        print(f"Concatenating... Total duration: {total_duration:.2f}s")
-        final_clip = concatenate_videoclips(clips, method="compose")
-        
-        print(f"Writing output to: {output_path}")
-        
-        if output_path.endswith(".webm"):
-            final_clip.write_videofile(
-                output_path,
-                codec="libvpx",
-                audio_codec="libvorbis",
-                fps=30,
-                preset="medium",
-                threads=4,
-                logger=None
-            )
-        else:
-            final_clip.write_videofile(
-                output_path,
-                codec="libx264",
-                audio_codec="aac",
-                fps=30,
-                preset="medium",
-                threads=4,
-                logger=None
-            )
-        
-        output_size = os.path.getsize(output_path)
-        print(f"Output written: {output_size:,} bytes")
-        
-        return {
-            "success": True,
-            "duration": final_clip.duration,
-            "size": final_clip.size,
-            "file_size_bytes": output_size,
-            "segments_count": len(clips)
-        }
-        
-    finally:
-        for clip in clips:
-            try:
-                clip.close()
-            except:
-                pass
-        if 'final_clip' in locals():
-            try:
-                final_clip.close()
-            except:
-                pass
+        if result.returncode != 0:
+            raise Exception(f"FFmpeg failed: {result.stderr}")
+    
+    output_size = os.path.getsize(output_path)
+    duration = get_video_duration(output_path)
+    
+    print(f"Output: {output_size:,} bytes, {duration:.2f}s")
+    
+    return {
+        "success": True,
+        "duration": duration,
+        "file_size_bytes": output_size,
+        "segments_count": len(segment_paths)
+    }
 
 
 def handler(job: dict) -> dict:
-    """RunPod handler for video stitching."""
+    """
+    RunPod handler for video stitching.
+    
+    Input:
+        segments: List[str] - URLs of video segments to concatenate
+        output_format: str - Output format (mp4 or webm), default: mp4
+        
+    Output:
+        video_base64: str - Base64-encoded video with data URI prefix
+        duration: float - Total duration in seconds
+        file_size_bytes: int - Output file size
+    """
     job_input = job.get("input", {})
     
+    # Validate input
     segments = job_input.get("segments", [])
     if not segments or len(segments) < 2:
         return {"error": "At least 2 video segment URLs are required"}
@@ -113,20 +138,24 @@ def handler(job: dict) -> dict:
     
     print(f"Job received: {len(segments)} segments, format={output_format}")
     
+    # Create temp directory
     temp_dir = tempfile.mkdtemp(prefix="stitch_")
     output_path = os.path.join(temp_dir, f"stitched.{output_format}")
     
     try:
+        # Download all segments
         segment_paths = []
         for i, url in enumerate(segments):
             path = download_video(url, temp_dir, i)
             segment_paths.append(path)
         
-        result = stitch_videos(segment_paths, output_path)
+        # Stitch videos
+        result = stitch_videos_ffmpeg(segment_paths, output_path)
         
         if not result.get("success"):
             return {"error": result.get("error", "Stitching failed")}
         
+        # Read output and encode as base64
         with open(output_path, "rb") as f:
             video_bytes = f.read()
         
@@ -138,8 +167,25 @@ def handler(job: dict) -> dict:
         return {
             "video_base64": f"data:{mime_type};base64,{video_base64}",
             "duration": result["duration"],
-            "fil
-
-
+            "file_size_bytes": result["file_size_bytes"],
+            "segments_count": result["segments_count"],
+            "format": output_format
+        }
             
+    except Exception as e:
+        import traceback
+        print(f"Error: {str(e)}")
+        traceback.print_exc()
+        return {"error": str(e)}
+        
+    finally:
+        # Cleanup temp files
+        import shutil
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except:
+            pass
 
+
+# RunPod serverless entry point
+runpod.serverless.start({"handler": handler})
