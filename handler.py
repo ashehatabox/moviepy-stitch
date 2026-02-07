@@ -3,12 +3,17 @@ RunPod Serverless Handler: FFmpeg Video Stitcher with Audio Overlay
 
 Uses pure FFmpeg (no MoviePy) - simpler and more reliable.
 Supports optional audio track muxing for narration/music overlay.
+Uploads result to Supabase storage and returns URL (avoids base64 memory issues).
 
 Dockerfile requirements:
 - Python 3.10+
 - ffmpeg (system package)
 - runpod>=1.3.0
 - requests>=2.28.0
+
+Environment Variables (set in RunPod):
+- SUPABASE_URL: Supabase project URL
+- SUPABASE_SERVICE_ROLE_KEY: Service role key for storage uploads
 """
 
 import os
@@ -18,6 +23,52 @@ import requests
 import runpod
 import base64
 from typing import List, Optional
+from datetime import datetime
+
+
+def upload_to_supabase(file_path: str, bucket: str = "persona-videos") -> Optional[str]:
+    """Upload file to Supabase storage and return public URL."""
+    supabase_url = os.environ.get("SUPABASE_URL")
+    service_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    
+    if not supabase_url or not service_key:
+        print("Supabase credentials not configured, falling back to base64")
+        return None
+    
+    # Generate unique filename
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ext = os.path.splitext(file_path)[1] or ".mp4"
+    filename = f"stitched/runpod_{timestamp}{ext}"
+    
+    # Read file
+    with open(file_path, "rb") as f:
+        file_data = f.read()
+    
+    # Determine content type
+    content_type = "video/webm" if ext == ".webm" else "video/mp4"
+    
+    # Upload to Supabase storage
+    upload_url = f"{supabase_url}/storage/v1/object/{bucket}/{filename}"
+    headers = {
+        "Authorization": f"Bearer {service_key}",
+        "Content-Type": content_type,
+        "x-upsert": "true"
+    }
+    
+    print(f"Uploading {len(file_data):,} bytes to Supabase: {filename}")
+    
+    try:
+        response = requests.post(upload_url, headers=headers, data=file_data, timeout=120)
+        if response.status_code in [200, 201]:
+            public_url = f"{supabase_url}/storage/v1/object/public/{bucket}/{filename}"
+            print(f"Upload successful: {public_url}")
+            return public_url
+        else:
+            print(f"Upload failed: {response.status_code} - {response.text[:200]}")
+            return None
+    except Exception as e:
+        print(f"Upload error: {str(e)}")
+        return None
 
 
 def download_file(url: str, temp_dir: str, prefix: str, index: int = 0) -> str:
@@ -249,7 +300,8 @@ def handler(job: dict) -> dict:
         output_format: str - Output format (mp4 or webm), default: mp4
         
     Output:
-        video_base64: str - Base64-encoded video with data URI prefix
+        video_url: str - Public URL of uploaded video (if Supabase configured)
+        video_base64: str - Base64-encoded video (fallback if no Supabase)
         duration: float - Total duration in seconds
         file_size_bytes: int - Output file size
         has_audio: bool - Whether audio was muxed
@@ -312,26 +364,40 @@ def handler(job: dict) -> dict:
                 print(f"Audio muxing error: {str(audio_err)}")
                 print("Continuing with video-only output")
         
-        # Read output and encode as base64
-        with open(output_path, "rb") as f:
-            video_bytes = f.read()
-        
-        print(f"Encoding {len(video_bytes):,} bytes as base64...")
-        
-        mime_type = "video/webm" if output_format == "webm" else "video/mp4"
-        video_base64 = base64.b64encode(video_bytes).decode("utf-8")
+        # Try to upload to Supabase first (avoids base64 memory issues)
+        video_url = upload_to_supabase(output_path)
         
         final_duration = get_video_duration(output_path)
         final_size = os.path.getsize(output_path)
         
-        return {
-            "video_base64": f"data:{mime_type};base64,{video_base64}",
-            "duration": final_duration,
-            "file_size_bytes": final_size,
-            "segments_count": stitch_result["segments_count"],
-            "format": output_format,
-            "has_audio": has_audio
-        }
+        if video_url:
+            # Return URL-based response (preferred)
+            return {
+                "video_url": video_url,
+                "duration": final_duration,
+                "file_size_bytes": final_size,
+                "segments_count": stitch_result["segments_count"],
+                "format": output_format,
+                "has_audio": has_audio
+            }
+        else:
+            # Fallback to base64 if upload fails
+            with open(output_path, "rb") as f:
+                video_bytes = f.read()
+            
+            print(f"Encoding {len(video_bytes):,} bytes as base64...")
+            
+            mime_type = "video/webm" if output_format == "webm" else "video/mp4"
+            video_base64 = base64.b64encode(video_bytes).decode("utf-8")
+            
+            return {
+                "video_base64": f"data:{mime_type};base64,{video_base64}",
+                "duration": final_duration,
+                "file_size_bytes": final_size,
+                "segments_count": stitch_result["segments_count"],
+                "format": output_format,
+                "has_audio": has_audio
+            }
             
     except Exception as e:
         import traceback
