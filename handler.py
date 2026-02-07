@@ -139,3 +139,7 @@ def handler(job: dict) -> dict:
             "video_base64": f"data:{mime_type};base64,{video_base64}",
             "duration": result["duration"],
             "fil
+
+
+            
+
